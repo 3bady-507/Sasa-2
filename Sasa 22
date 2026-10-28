@@ -1,0 +1,921 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'LANCHAT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LanChat"
+          include(":app")
+          LANCHAT_EOF
+          cat > build.gradle.kts <<'LANCHAT_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          LANCHAT_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'LANCHAT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.lanchat"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.lanchat"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'LANCHAT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:label="تطبيق عبدالله"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ChatService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/Net.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.content.Context
+          import android.net.wifi.WifiManager
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.NetworkInterface
+          import java.util.UUID
+          import kotlin.concurrent.thread
+
+          object Net {
+              const val UDP_PORT = 45678
+              const val TCP_PORT = 45679
+              const val SEP = "\u0001"
+              const val MAGIC = "LANCHAT2"
+
+              val myId: String = UUID.randomUUID().toString().replace("-", "").take(8)
+
+              fun newId(): String = UUID.randomUUID().toString().replace("-", "").take(16)
+
+              fun packet(msgId: String, kind: String, name: String, payload: String): ByteArray {
+                  return listOf(MAGIC, msgId, myId, kind, name, payload)
+                      .joinToString(SEP)
+                      .toByteArray(Charsets.UTF_8)
+              }
+
+              fun broadcast(ctx: Context, data: ByteArray) {
+                  val app = ctx.applicationContext
+                  thread(isDaemon = true) {
+                      try {
+                          DatagramSocket().use { s ->
+                              s.broadcast = true
+                              repeat(2) {
+                                  for (addr in broadcastAddresses(app)) {
+                                      try {
+                                          s.send(DatagramPacket(data, data.size, addr, UDP_PORT))
+                                      } catch (_: Exception) {
+                                      }
+                                  }
+                                  Thread.sleep(150)
+                              }
+                          }
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              fun broadcastAddresses(ctx: Context): List<InetAddress> {
+                  val out = LinkedHashSet<InetAddress>()
+                  try {
+                      val nis = NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
+                      for (ni in nis) {
+                          if (!ni.isUp || ni.isLoopback) continue
+                          for (ia in ni.interfaceAddresses) {
+                              val b = ia.broadcast
+                              if (b != null) out.add(b)
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      val wm = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      val d = wm.dhcpInfo
+                      if (d != null && d.ipAddress != 0) {
+                          val b = (d.ipAddress and d.netmask) or d.netmask.inv()
+                          val bytes = ByteArray(4) { i -> ((b shr (8 * i)) and 0xff).toByte() }
+                          out.add(InetAddress.getByAddress(bytes))
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      out.add(InetAddress.getByName("255.255.255.255"))
+                  } catch (_: Exception) {
+                  }
+                  return out.toList()
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/Store.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          data class Msg(
+              val mine: Boolean,
+              val name: String,
+              val text: String,
+              val imgId: String,
+              val time: String
+          )
+
+          object Store {
+              private fun file(ctx: Context): File = File(ctx.filesDir, "chat.log")
+
+              fun now(): String = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+
+              @Synchronized
+              fun append(ctx: Context, m: Msg) {
+                  val fields = listOf(if (m.mine) "1" else "0", m.name, m.time, m.imgId, m.text)
+                  val line = fields.joinToString(Net.SEP) {
+                      it.replace("\n", "\u0002").replace(Net.SEP, " ")
+                  } + "\n"
+                  file(ctx).appendText(line, Charsets.UTF_8)
+              }
+
+              @Synchronized
+              fun load(ctx: Context, max: Int = 200): List<Msg> {
+                  val f = file(ctx)
+                  if (!f.exists()) return emptyList()
+                  val out = ArrayList<Msg>()
+                  for (line in f.readLines(Charsets.UTF_8).takeLast(max)) {
+                      val p = line.split(Net.SEP, limit = 5)
+                      if (p.size == 5) {
+                          out.add(Msg(p[0] == "1", p[1], p[4].replace("\u0002", "\n"), p[3], p[2]))
+                      }
+                  }
+                  return out
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/BootReceiver.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  try {
+                      context.startForegroundService(Intent(context, ChatService::class.java))
+                  } catch (_: Exception) {
+                  }
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/ChatService.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.util.concurrent.atomic.AtomicInteger
+          import kotlin.concurrent.thread
+
+          class ChatService : Service() {
+
+              companion object {
+                  const val CH_SVC = "svc"
+                  const val CH_MSG = "msg"
+                  const val FIRST_MSG_NOTIF = 100
+
+                  @Volatile
+                  var listener: ((Msg) -> Unit)? = null
+
+                  @Volatile
+                  var appVisible = false
+              }
+
+              @Volatile
+              private var running = true
+              private var udp: DatagramSocket? = null
+              private var tcp: ServerSocket? = null
+              private var mcLock: WifiManager.MulticastLock? = null
+              private var wakeLock: PowerManager.WakeLock? = null
+              private val seen = LinkedHashSet<String>()
+              private val notifId = AtomicInteger(FIRST_MSG_NOTIF)
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createChannels()
+                  val n = Notification.Builder(this, CH_SVC)
+                      .setSmallIcon(android.R.drawable.stat_notify_chat)
+                      .setContentTitle("تطبيق عبدالله")
+                      .setContentText("يستقبل الرسائل في الخلفية")
+                      .setOngoing(true)
+                      .setContentIntent(openAppIntent())
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  } else {
+                      startForeground(1, n)
+                  }
+
+                  try {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      mcLock = wm.createMulticastLock("lanchat").apply {
+                          setReferenceCounted(false)
+                          acquire()
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lanchat:service").apply {
+                          setReferenceCounted(false)
+                          acquire()
+                      }
+                  } catch (_: Exception) {
+                  }
+
+                  thread(isDaemon = true) { receiveLoop() }
+                  thread(isDaemon = true) { serveLoop() }
+              }
+
+              private fun createChannels() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH_SVC, "الخدمة", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH_MSG, "الرسائل", NotificationManager.IMPORTANCE_HIGH)
+                  )
+              }
+
+              private fun openAppIntent(): PendingIntent {
+                  val i = Intent(this, MainActivity::class.java)
+                      .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return PendingIntent.getActivity(
+                      this, 0, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+              }
+
+              private fun receiveLoop() {
+                  while (running) {
+                      try {
+                          val s = DatagramSocket(null)
+                          s.reuseAddress = true
+                          s.broadcast = true
+                          s.bind(InetSocketAddress(Net.UDP_PORT))
+                          udp = s
+                          val buf = ByteArray(8192)
+                          while (running) {
+                              val p = DatagramPacket(buf, buf.size)
+                              s.receive(p)
+                              try {
+                                  handle(p)
+                              } catch (_: Exception) {
+                              }
+                          }
+                      } catch (_: Exception) {
+                          if (running) Thread.sleep(2000)
+                      }
+                  }
+              }
+
+              private fun handle(p: DatagramPacket) {
+                  val raw = String(p.data, 0, p.length, Charsets.UTF_8)
+                  val a = raw.split(Net.SEP, limit = 6)
+                  if (a.size != 6 || a[0] != Net.MAGIC) return
+                  val msgId = a[1]
+                  val sender = a[2]
+                  val kind = a[3]
+                  val name = a[4]
+                  val payload = a[5]
+                  if (sender == Net.myId) return
+                  synchronized(seen) {
+                      if (!seen.add(msgId)) return
+                      if (seen.size > 300) seen.remove(seen.first())
+                  }
+                  val host = p.address.hostAddress ?: return
+                  when (kind) {
+                      "T" -> deliver(Msg(false, name, payload, "", Store.now()))
+                      "I" -> {
+                          if (!payload.matches(Regex("[A-Za-z0-9]{1,32}"))) return
+                          thread(isDaemon = true) {
+                              var ok = false
+                              var tries = 0
+                              while (!ok && tries < 3) {
+                                  tries++
+                                  ok = try {
+                                      fetchImage(host, payload)
+                                  } catch (_: Exception) {
+                                      false
+                                  }
+                                  if (!ok) Thread.sleep(500)
+                              }
+                              if (ok) deliver(Msg(false, name, "", payload, Store.now()))
+                          }
+                      }
+                  }
+              }
+
+              private fun fetchImage(host: String, imgId: String): Boolean {
+                  Socket().use { sock ->
+                      sock.connect(InetSocketAddress(host, Net.TCP_PORT), 5000)
+                      sock.soTimeout = 15000
+                      val os = sock.getOutputStream()
+                      os.write((imgId + "\n").toByteArray(Charsets.UTF_8))
+                      os.flush()
+                      val dir = File(filesDir, "img")
+                      dir.mkdirs()
+                      val f = File(dir, "$imgId.jpg")
+                      FileOutputStream(f).use { out -> sock.getInputStream().copyTo(out) }
+                      return f.length() > 0
+                  }
+              }
+
+              private fun serveLoop() {
+                  while (running) {
+                      try {
+                          val ss = ServerSocket()
+                          ss.reuseAddress = true
+                          ss.bind(InetSocketAddress(Net.TCP_PORT))
+                          tcp = ss
+                          while (running) {
+                              val c = ss.accept()
+                              thread(isDaemon = true) { serve(c) }
+                          }
+                      } catch (_: Exception) {
+                          if (running) Thread.sleep(2000)
+                      }
+                  }
+              }
+
+              private fun serve(c: Socket) {
+                  try {
+                      c.use { sock ->
+                          sock.soTimeout = 10000
+                          val id = sock.getInputStream().bufferedReader().readLine() ?: return
+                          if (!id.matches(Regex("[A-Za-z0-9]{1,32}"))) return
+                          val f = File(File(filesDir, "img"), "$id.jpg")
+                          if (!f.exists()) return
+                          val os = sock.getOutputStream()
+                          f.inputStream().use { inp -> inp.copyTo(os) }
+                          os.flush()
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun deliver(m: Msg) {
+                  Store.append(this, m)
+                  notifyMsg(m)
+                  listener?.invoke(m)
+              }
+
+              private fun notifyMsg(m: Msg) {
+                  if (appVisible) return
+                  val body = if (m.imgId.isNotEmpty()) "📷 صورة" else m.text
+                  val n = Notification.Builder(this, CH_MSG)
+                      .setSmallIcon(android.R.drawable.stat_notify_chat)
+                      .setContentTitle(m.name)
+                      .setContentText(body)
+                      .setContentIntent(openAppIntent())
+                      .setAutoCancel(true)
+                      .build()
+                  try {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.notify(notifId.getAndIncrement(), n)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  try {
+                      udp?.close()
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      tcp?.close()
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      mcLock?.release()
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      wakeLock?.release()
+                  } catch (_: Exception) {
+                  }
+                  super.onDestroy()
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/MainActivity.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.media.ExifInterface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val pickImage = 7
+
+              private lateinit var list: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var nameBox: EditText
+              private lateinit var msgBox: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  try {
+                      startForegroundService(Intent(this, ChatService::class.java))
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "تعذر تشغيل الخدمة: " + e.message, Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  ChatService.appVisible = true
+                  list.removeAllViews()
+                  for (m in Store.load(this)) addMsg(m)
+                  ChatService.listener = { m -> runOnUiThread { addMsg(m) } }
+                  try {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      for (sn in nm.activeNotifications) {
+                          if (sn.id >= ChatService.FIRST_MSG_NOTIF) nm.cancel(sn.id)
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              override fun onStop() {
+                  ChatService.appVisible = false
+                  ChatService.listener = null
+                  super.onStop()
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val match = LinearLayout.LayoutParams.MATCH_PARENT
+                  val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#ECE5DD"))
+                  }
+
+                  val title = TextView(this).apply {
+                      this.text = "💬 تطبيق عبدالله"
+                      setTextColor(Color.WHITE)
+                      textSize = 20f
+                      setPadding(dp(16), dp(14), dp(8), dp(14))
+                  }
+                  val batteryBtn = TextView(this).apply {
+                      this.text = "🔋"
+                      textSize = 22f
+                      setPadding(dp(14), dp(10), dp(14), dp(10))
+                      setOnClickListener { askBattery() }
+                  }
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setBackgroundColor(Color.parseColor("#075E54"))
+                      addView(title, LinearLayout.LayoutParams(0, wrap, 1f))
+                      addView(batteryBtn, LinearLayout.LayoutParams(wrap, wrap))
+                  }
+
+                  val prefs = getSharedPreferences("chat", MODE_PRIVATE)
+                  nameBox = EditText(this).apply {
+                      hint = "اسمك"
+                      setSingleLine(true)
+                      setText(prefs.getString("name", ""))
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                  }
+
+                  list = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(8), dp(8), dp(8), dp(8))
+                  }
+                  scroll = ScrollView(this).apply { addView(list) }
+
+                  msgBox = EditText(this).apply {
+                      hint = "اكتب رسالة..."
+                      setSingleLine(true)
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      setOnEditorActionListener { _, actionId, _ ->
+                          if (actionId == EditorInfo.IME_ACTION_SEND) {
+                              sendText()
+                              true
+                          } else {
+                              false
+                          }
+                      }
+                  }
+                  val photoBtn = Button(this).apply {
+                      this.text = "📷"
+                      setOnClickListener { choosePhoto() }
+                  }
+                  val sendBtn = Button(this).apply {
+                      this.text = "إرسال"
+                      setOnClickListener { sendText() }
+                  }
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
+                      addView(photoBtn, LinearLayout.LayoutParams(wrap, wrap))
+                      addView(msgBox, LinearLayout.LayoutParams(0, wrap, 1f))
+                      addView(sendBtn, LinearLayout.LayoutParams(wrap, wrap))
+                  }
+
+                  root.addView(header, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(nameBox, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(scroll, LinearLayout.LayoutParams(match, 0, 1f))
+                  root.addView(row, LinearLayout.LayoutParams(match, wrap))
+                  setContentView(root)
+              }
+
+              private fun askBattery() {
+                  try {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                          Toast.makeText(this, "تحسين البطارية معطّل مسبقاً للتطبيق ✅", Toast.LENGTH_LONG).show()
+                      } else {
+                          val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                          i.data = Uri.parse("package:" + packageName)
+                          startActivity(i)
+                      }
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "افتح إعدادات البطارية للتطبيق يدوياً", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              private fun currentName(): String {
+                  val typed = nameBox.text.toString().trim()
+                  getSharedPreferences("chat", MODE_PRIVATE).edit().putString("name", typed).apply()
+                  return if (typed.isEmpty()) "مجهول" else typed
+              }
+
+              private fun sendText() {
+                  val body = msgBox.text.toString().trim()
+                  if (body.isEmpty()) return
+                  val who = currentName()
+                  msgBox.setText("")
+                  val m = Msg(true, who, body, "", Store.now())
+                  Store.append(this, m)
+                  addMsg(m)
+                  Net.broadcast(this, Net.packet(Net.newId(), "T", who, body))
+              }
+
+              private fun choosePhoto() {
+                  val i = Intent(Intent.ACTION_GET_CONTENT)
+                  i.type = "image/*"
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  startActivityForResult(i, pickImage)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != pickImage || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  val who = currentName()
+                  thread {
+                      val bmp = try {
+                          loadScaled(uri, 1024)
+                      } catch (_: Exception) {
+                          null
+                      }
+                      if (bmp == null) {
+                          runOnUiThread {
+                              Toast.makeText(this, "تعذر قراءة الصورة", Toast.LENGTH_LONG).show()
+                          }
+                          return@thread
+                      }
+                      val id = Net.newId()
+                      val dir = File(filesDir, "img")
+                      dir.mkdirs()
+                      FileOutputStream(File(dir, "$id.jpg")).use { out ->
+                          bmp.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                      }
+                      val m = Msg(true, who, "", id, Store.now())
+                      Store.append(this, m)
+                      runOnUiThread { addMsg(m) }
+                      Net.broadcast(this, Net.packet(Net.newId(), "I", who, id))
+                  }
+              }
+
+              private fun loadScaled(uri: Uri, maxSide: Int): Bitmap? {
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                  var sample = 1
+                  while (bounds.outWidth / sample > maxSide * 2 || bounds.outHeight / sample > maxSide * 2) {
+                      sample *= 2
+                  }
+                  val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                  val src = contentResolver.openInputStream(uri)?.use {
+                      BitmapFactory.decodeStream(it, null, opts)
+                  } ?: return null
+
+                  val orientation = try {
+                      contentResolver.openInputStream(uri)?.use {
+                          ExifInterface(it).getAttributeInt(
+                              ExifInterface.TAG_ORIENTATION,
+                              ExifInterface.ORIENTATION_NORMAL
+                          )
+                      } ?: ExifInterface.ORIENTATION_NORMAL
+                  } catch (_: Exception) {
+                      ExifInterface.ORIENTATION_NORMAL
+                  }
+                  val degrees = when (orientation) {
+                      ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                      ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                      ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                      else -> 0f
+                  }
+                  val scale = minOf(1f, maxSide.toFloat() / maxOf(src.width, src.height))
+                  val m = Matrix()
+                  m.postScale(scale, scale)
+                  if (degrees != 0f) m.postRotate(degrees)
+                  return Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+              }
+
+              private fun addMsg(m: Msg) {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(10).toFloat()
+                          setColor(Color.parseColor(if (m.mine) "#DCF8C6" else "#FFFFFF"))
+                      }
+                  }
+                  val who = TextView(this).apply {
+                      this.text = m.name
+                      setTextColor(Color.parseColor("#075E54"))
+                      textSize = 13f
+                      setTypeface(null, Typeface.BOLD)
+                  }
+                  box.addView(who)
+
+                  if (m.imgId.isNotEmpty()) {
+                      val f = File(File(filesDir, "img"), m.imgId + ".jpg")
+                      val bmp = if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+                      if (bmp != null) {
+                          val iv = ImageView(this).apply {
+                              setImageBitmap(bmp)
+                              adjustViewBounds = true
+                              maxWidth = dp(240)
+                          }
+                          box.addView(iv)
+                      } else {
+                          box.addView(TextView(this).apply { this.text = "(الصورة غير متاحة)" })
+                      }
+                  }
+                  if (m.text.isNotEmpty()) {
+                      box.addView(TextView(this).apply {
+                          this.text = m.text
+                          setTextColor(Color.BLACK)
+                          textSize = 16f
+                      })
+                  }
+                  box.addView(TextView(this).apply {
+                      this.text = m.time
+                      textSize = 10f
+                      setTextColor(Color.GRAY)
+                  })
+
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.WRAP_CONTENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  )
+                  lp.setMargins(0, dp(4), 0, dp(4))
+                  lp.gravity = if (m.mine) Gravity.END else Gravity.START
+                  list.addView(box, lp)
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp <<'ICON_EOF' || true
+          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
+          VSSNgWTgBcgAAAA=
+          ICON_EOF
+          if [ "$(stat -c %s app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp)" != "3260" ]; then
+            rm -f app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp
+            sed -i '/android:icon=/d' app/src/main/AndroidManifest.xml
+          fi
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lan-chat-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
